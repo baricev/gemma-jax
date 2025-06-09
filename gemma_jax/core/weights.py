@@ -1,144 +1,163 @@
-"""Experimental sharding and loading code for Gemma3.
+# %% 
 
-This module provides helper functions for:
-  - loading and formatting checkpoints,
-  - creating a device mesh,
-  - computing PartitionSpec trees,
-  - sharding parameters or NamedTuples models.
+"""gemma3_sharding_refactored.py
+================================
+A JAX-idiomatic helper module for sharding **Gemma-3** checkpoints.
 
+This streamlined version
+* keeps *no-boiler-plate* pytree compatibility by using plain
+  `typing.NamedTuple` for both **PartitionSpec** trees and runtime model
+  states, and
+* exposes a tiny public API (`create_config`, `create_device_mesh`,
+  `load_model`, `load_params`).
+
+Place the file anywhere on your `$PYTHONPATH`, `pip install orbax` for
+checkpoint restore support, and you can immediately shard Gemma-3
+checkpoints across CPU, GPU, or TPU meshes.
 """
+from __future__ import annotations
+
+import functools
+import logging
+import math
+import time
+from dataclasses import dataclass, replace
+from enum import IntEnum
+from pathlib import Path
+from typing import Any, NamedTuple, TypeVar
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.random import categorical
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from jax import Array
-
 import orbax.checkpoint as ocp
-from dataclasses import replace
-import functools
-from functools import partial
-import os
-import time
-from typing import Any, NamedTuple, TypeVar, Union
+from jax import Array
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1.00"
+__all__ = [
+    "Config",
+    "create_config",
+    "create_device_mesh",
+    "load_model",
+    "load_params",
+]
 
-PAD_ID: int = 0
-EOS_ID: int = 1
-K_MASK: float = -2.3819763e38
-ATTENTION_TYPE_GLOBAL: int = 1
-ATTENTION_TYPE_LOCAL_SLIDING: int = 2
-GEMMA3_ATTENTION_PATTERN: tuple[int, ...] = (2, 2, 2, 2, 2, 1)
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s] %(message)s")
+_logger = logging.getLogger("gemma3.shard")
 
-# --- Type Definitions ---
-T = TypeVar("T")
-Leaf = Any
-FlatDict = dict[str, Array]
-NestedDict = dict[str, Any]
+# -----------------------------------------------------------------------------
+# Constants & enums
+# -----------------------------------------------------------------------------
 
-# --- Constants ---
-
-# Text decoder constants
-PAD_ID = 0
-EOS_ID = 1
-K_MASK = -2.3819763e38
-
-ATTENTION_TYPE_GLOBAL = 1
-ATTENTION_TYPE_LOCAL_SLIDING = 2
-
-GEMMA3_ATTENTION_PATTERN = (
-    2,
-    2,
-    2,
-    2,
-    2,
-    1,  # LOCAL_SLIDING * 5, GLOBAL * 1
-)
+class SpecialToken(IntEnum):
+    PAD = 0
+    EOS = 1
 
 
-# --- Model Configuration ---
-
-GEMMA3_VARIANTS = np.array(
-    [
-        # 1B, 4B, 12B, 27B
-        [1, 4, 12, 27],  # model_size
-        [26, 34, 48, 62],  # num_layers
-        [4, 8, 16, 32],  # num_heads
-        [1, 4, 8, 16],  # num_kv_heads
-        [1152, 2560, 3840, 5376],  # embed_dim (9*128, 20*128, 30*128, 42*128)
-        # hidden_dim (6*9*128, 4*20*128, 4*30*128, 4*42*128)
-        [6912, 15360, 20480, 21504],
-        [256, 256, 256, 128],  # head_dim (2*128, 2*128, 2*128, 1*128)
-    ],
-    np.int32,
-)
+class AttentionType(IntEnum):
+    GLOBAL = 1
+    LOCAL_SLIDING = 2
 
 
-class VariantConfig(NamedTuple):
-  model_size: int
-  num_layers: int
-  num_heads: int
-  num_kv_heads: int
-  embed_dim: int
-  hidden_dim: int
-  head_dim: int
+# Base six-layer attention pattern ------------------------------------------------
+_BASE_PATTERN: tuple[AttentionType, ...] = (
+    AttentionType.LOCAL_SLIDING,
+) * 5 + (AttentionType.GLOBAL,)
 
+# Gemma-3 variant table -----------------------------------------------------------
+# fmt: off
+_GEMMA3_VARIANTS = np.array([
+    #  1B   4B    12B    27B
+    [   1,   4,    12,    27],   # model size (B)
+    [  26,  34,    48,    62],   # layers
+    [   4,   8,    16,    32],   # heads
+    [   1,   4,     8,    16],   # kv-heads
+    [1152, 2560,  3840,  5376],  # embed-dim
+    [6912,10240, 15360, 21504],  # mlp-hidden_dim (6*9*128, 4*20*128, 4*30*128, 4*42*128)
+    [ 256,  256,   256,   128],  # head-dim
+], dtype=np.int32)
+# fmt: on
 
-def get_gemma3_variants(variant: int) -> list[int]:
-  """Retrieve configuration parameters for a specific Gemma3 model variant.
+_ROW = {
+    "model_size": 0,
+    "num_layers": 1,
+    "num_heads": 2,
+    "num_kv_heads": 3,
+    "embed_dim": 4,
+    "hidden_dim": 5,
+    "head_dim": 6,
+}
 
-  Args:
-      The model size variant (e.g., 1, 4, 12, 27).
-  Returns:
-      A list containing [num_layers, num_heads, num_kv_heads, embed_dim, hidden_dim, head_dim].
-  """
+# -----------------------------------------------------------------------------
+# Config dataclass
+# -----------------------------------------------------------------------------
 
-  # find the index of the variant in the gemma3_variants array
-  index = np.where(GEMMA3_VARIANTS[0] == variant)[0][0]
-  # return the corresponding values for num_layers, num_heads, num_kv_heads, embed_dim, hidden_dim
-  config = GEMMA3_VARIANTS[1:, index]
-  return config.tolist()
+@dataclass(frozen=True, slots=True)
+class Config:
+    # Architecture
+    model_size: int
+    num_layers: int
+    num_heads: int
+    num_kv_heads: int
+    embed_dim: int
+    hidden_dim: int
+    head_dim: int
 
+    # Runtime
+    batch_size: int
+    window_size: int
+    cache_length: int
+    chunk_length: int
+    # max_gen_length: int
+    generate_steps: int
 
-class Config(NamedTuple):
-  batch_size: int
-  padded_input_size: int
-  model_size: int
-  num_layers: int
-  num_heads: int
-  num_kv_heads: int
-  embed_dim: int
-  hidden_dim: int
-  head_dim: int
-  # Remaining fields are the same except for the 1B model which does not use GQA
-  vocab_size: int
-  query_pre_attn_scalar: float
-  attention_types: tuple[int, ...]
-  attention_pattern: tuple[int, ...]
-  local_base_frequency: int
-  global_base_frequency: int
-  global_scale_factor: float
-  local_scale_factor: float
-  final_logit_softcap: float | None
-  window_size: int
-  transpose_gating_einsum: bool
-  attn_logits_soft_cap: float | None
-  use_post_attn_norm: bool
-  use_post_ffw_norm: bool
-  use_qk_norm: bool
-  vision_encoder: tuple[int, ...] | None  # Placeholder type
-  mm_extra_vocab_size: int | None
-  cache_length: int = 1024
-  use_rope_cache: bool = False
-  rope_cache: Array | None = None
-  max_position_length: int = 1024
-  max_gen_length: int = 1024
-  generate_steps: int = 1
+    # Attention
+    query_pre_attn_scalar: float
+    attention_pattern: tuple[AttentionType, ...] = _BASE_PATTERN
 
+    # Vocab / logits
+    vocab_size: int = 262_144
+    final_logit_softcap: float | None = None
 
-def query_pre_attn_norm(model_size: int) -> float:
+    # Norm flags
+    use_post_attn_norm: bool = True
+    use_post_ffw_norm: bool = True
+    use_qk_norm: bool = True
+
+    # Rotary cache
+    use_rope_cache: bool = False
+    rope_cache: Array | None = None
+
+    # Extra (vision etc.)
+    vision_encoder: tuple[int, ...] | None = None
+    mm_extra_vocab_size: int = 0
+
+    # Frequencies
+    local_base_frequency: int = 10_000
+    local_scale_factor: float = 1.0
+    global_base_frequency: int = 1_000_000
+    global_scale_factor: float = 8.0
+
+    # Misc
+    transpose_gating_einsum: bool = True
+    attn_logits_soft_cap: float | None = None
+
+    # # Alias for back-compat
+    # @property
+    # def attention_types(self):
+    #     return self.attention_pattern
+
+# -----------------------------------------------------------------------------
+# Config factory
+# -----------------------------------------------------------------------------
+
+def _tile_pattern(n: int) -> tuple[AttentionType, ...]:
+    rep, rem = divmod(n, len(_BASE_PATTERN))
+    return _BASE_PATTERN * rep + _BASE_PATTERN[:rem]
+
+def get_query_pre_attn_norm(model_size: int) -> float:
   """Calculate the pre-attention normalization scalar for the query.
 
   Scales by '1/sqrt(embed_dim // num_heads)' if 27B model,
@@ -150,423 +169,343 @@ def query_pre_attn_norm(model_size: int) -> float:
   return (embed_dim_27b / num_heads_27b) ** -0.5 if model_size == 27 else (head_dim_27b * 2) ** -0.5
 
 
-def make_attn_layers_types(
-    pattern: tuple[int, ...],
-    num_layers: int,
-) -> tuple[int, ...]:
-  """Returns attention patterns for each layer by repeating the input pattern.
+def create_config(*, model_size: int, batch_size: int, chunk_length: int,
+                  window_size: int, cache_length: int, generate_steps: int,
+                  **kw) -> Config:
+    """Return a fully specified :class:`Config`.  Extra `kw` override defaults."""
+    if model_size not in (1, 4, 12, 27):
+        raise ValueError("Model size must be 1, 4, 12, or 27 (billions).")
 
-  Args:
-    pattern: The base pattern sequence to repeat.
-    num_layers: Total number of attention layers needed.
+    col = int(np.where(_GEMMA3_VARIANTS[_ROW["model_size"]] == model_size)[0][0])
+    base = {k: int(_GEMMA3_VARIANTS[row, col]) for k, row in _ROW.items() if k != "model_size"}
 
-  Returns:
-    A tuple of attention patterns with length equal to num_layers.
-  """
-  full_repeats, remainder = divmod(num_layers, len(pattern))
-  return tuple(pattern * full_repeats + pattern[:remainder])
+    # q_scalar = ( (base["embed_dim"] / base["num_heads"]) ** -0.5 if model_size == 27 else (256 * 2) ** -0.5) #BUG
+    q_scalar = get_query_pre_attn_norm(model_size)
 
+    cfg = Config(
+        model_size=model_size,
+        batch_size=batch_size,
+        chunk_length=chunk_length,
+        window_size=window_size,
+        cache_length=cache_length,
+        # max_gen_length=max_gen_length,
+        generate_steps=generate_steps,
+        attention_pattern=_tile_pattern(base["num_layers"]),
+        query_pre_attn_scalar=q_scalar,
+        **base,
+    )
+    return replace(cfg, **kw)
 
-def create_gemma3_config(
-    model_size: int,
-    batch_size: int,
-    padded_input_size: int,
-    cache_length: int = 1024,
-    window_size: int = 1024,
-    use_rope_cache: bool = False,
-    rope_cache: Array | None = None,
-    max_position_length: int = 1024,
-    max_gen_length: int = 1024,
-    generate_steps: int = 1,
-) -> Config:
-  """Create Configuration for Gemma3 series of models."""
-  if model_size not in [1, 4, 12, 27]:
-    raise ValueError(f"Unsupported model size: {model_size}")
-
-  # Get the configuration for the specified model size
-  (
-      num_layers,
-      num_heads,
-      num_kv_heads,
-      embed_dim,
-      hidden_dim,
-      head_dim,
-  ) = get_gemma3_variants(model_size)
-  assert (
-      len(make_attn_layers_types((2, 2, 2, 2, 2, 1), num_layers)) == num_layers
-  ), "Attention layers types mismatch with num_layers"
-
-  return Config(
-      model_size=model_size,
-      batch_size=batch_size,
-      padded_input_size=padded_input_size,
-      cache_length=cache_length,
-      window_size=window_size,
-      num_layers=num_layers,
-      num_heads=num_heads,
-      num_kv_heads=num_kv_heads,
-      embed_dim=embed_dim,
-      hidden_dim=hidden_dim,
-      head_dim=head_dim,
-      query_pre_attn_scalar=query_pre_attn_norm(model_size),
-      attention_types=make_attn_layers_types((2, 2, 2, 2, 2, 1), num_layers),
-      attention_pattern=make_attn_layers_types((2, 2, 2, 2, 2, 1), num_layers),
-      vocab_size=262144,
-      use_post_attn_norm=True,
-      use_post_ffw_norm=True,
-      use_qk_norm=True,
-      attn_logits_soft_cap=None,
-      final_logit_softcap=None,
-      transpose_gating_einsum=True,
-      local_base_frequency=10_000,
-      local_scale_factor=1.0,
-      global_base_frequency=1_000_000,
-      global_scale_factor=8.0,
-      vision_encoder=None,  # if text_only else gemma_vision.SigLiPFromPatches(),
-      mm_extra_vocab_size=0,  # if text_only else 128,
-      use_rope_cache=use_rope_cache,
-      rope_cache=rope_cache,
-      max_position_length=max_position_length,
-      max_gen_length=max_gen_length,
-      generate_steps=generate_steps,
-  )
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+_T = TypeVar("_T")
+FlatDict = dict[str, Array]
+NestedDict = dict[str, Any]
 
 
-# --- Model Definition ---
+def _flatten_pytree_with_dots(tree) -> FlatDict:
+    flat, _ = jax.tree_util.tree_flatten_with_path(tree)
+
+    def _p2s(p):
+        parts: list[str] = []
+        for k in p:
+            parts.append(str(getattr(k, "key", getattr(k, "name", getattr(k, "idx", k)))))
+        return ".".join(parts)
+
+    return {_p2s(path): v for path, v in flat}
+
+# -----------------------------------------------------------------------------
+# Device mesh creation
+# -----------------------------------------------------------------------------
+
+def create_device_mesh(shape: tuple[int | None, int | None] | None = None, *, axis_names=("data", "model")) -> Mesh:
+    devs = jax.devices()
+    if {d.platform for d in devs} == {"cpu"}:  # trivial 1×1 mesh on CPU
+        return Mesh(np.array(devs).reshape((1, 1)), axis_names=axis_names)
+
+    n = len(devs)
+    if shape is None or shape == (None, None):  # heuristic square factor
+        side = int(math.sqrt(n))
+        while side > 1 and n % side:
+            side -= 1
+        data, model = side, n // side
+    else:
+        data, model = shape
+        if data is None and model is None:
+            raise ValueError("shape cannot be (None, None)")
+        if data is None:
+            if n % model:
+                raise ValueError(f"{n} devs can't fit (_, {model})")
+            data = n // model
+        if model is None:
+            if n % data:
+                raise ValueError(f"{n} devs can't fit ({data}, _)")
+            model = n // data
+    if data * model > n:
+        raise ValueError("Mesh larger than available devices")
+
+    mesh = Mesh(np.array(devs[: data * model]).reshape((data, model)), axis_names=axis_names)
+    _logger.info("Mesh %dx%d constructed on %d devices", data, model, n)
+    return mesh
+
+# -----------------------------------------------------------------------------
+# Checkpoint loading utils
+# -----------------------------------------------------------------------------
+
+@functools.cache
+def _restore_ckpt(path: str | Path):
+    return ocp.PyTreeCheckpointer().restore(str(path))
+
+
+def _load_flat_params(path: str | Path, *, dtype: jnp.dtype | None = None, keep_siglip: bool = False) -> FlatDict:
+    _logger.info("Reading checkpoint %s", path)
+    raw = _restore_ckpt(path)
+    flat = _flatten_pytree_with_dots(raw)
+    if not keep_siglip:
+        flat = {k: v for k, v in flat.items() if not k.startswith("SigLiPFromPatches_0")}
+    if dtype:
+        flat = jax.tree_util.tree_map(lambda x: x.astype(dtype), flat)
+    return {k.replace("/", "."): v for k, v in flat.items()}
+
+# -----------------------------------------------------------------------------
+# Gemma-3 runtime structures
+# -----------------------------------------------------------------------------
+
+# fmt: off
 class Layer(NamedTuple):
-  attn_key_norm_scale: Array  # (head_dim,) - Replicated
-  attn_query_norm_scale: Array  # (head_dim,) - Replicated
-  output_proj: Array  # (num_heads, head_dim, embed_dim) -> Shard embed_dim
-  kv_proj: Array  # (2, K, D, H) -> Shard embed_dim
-  q_proj: Array  # (N, D, H) -> Shard embed_dim #
-  gating_weights: Array  # (2, F, D) -> Shard hidden_dim (D)
-  output_weights: Array  # (num_heads, head_dim, embed_dim) -> Shard embed_dim
-  post_attention_norm_scale: Array  # (embed_dim,) - Replicated
-  post_ffw_norm_scale: Array  # (embed_dim,) - Replicated
-  pre_attention_norm_scale: Array  # (embed_dim,) - Replicated
-  pre_ffw_norm_scale: Array  # (embed_dim,) - Replicated
+    attn_key_norm_scale         :  Array   # (head_dim,)                             (H,)
+    attn_query_norm_scale       :  Array   # (head_dim,)                             (H,)
+    output_proj                 :  Array   # (num_heads, head_dim, embed_dim)        (N,H,D)
+    kv_proj                     :  Array   # (2, num_kv_heads, embed_dim, head_dim)  (2,K,D,H)
+    q_proj                      :  Array   # (num_heads, embed_dim, head_dim)        (N,D,H)
+    gating_weights              :  Array   # (2, mlp_hidden_dim, embed_dim)          (2,F,D)
+    output_weights              :  Array   # (mlp_hidden_dim, embed_dim)             (F,D)
+    post_attention_norm_scale   :  Array   # (embed_dim,)                            (D,)
+    post_ffw_norm_scale         :  Array   # (embed_dim,)                            (D,)
+    pre_attention_norm_scale    :  Array   # (embed_dim,)                            (D,)
+    pre_ffw_norm_scale          :  Array   # (embed_dim,)                            (D,)
 
 
 class Gemma3(NamedTuple):
-  # (vocab_size, embed_dim) -> Shard embed_dim
-  input_embedding_table: Array
-  # Ignored mm fields for text-only
-  mm_input_projection: Array
-  mm_soft_embedding_norm: Array
-  final_norm_scale: Array  # (embed_dim,) - Replicated
-  blocks: list[Layer]  # list of Layers
+    input_embedding_table       :  Array   # (vocab_size, embed_dim)                 (V,D)
+    mm_input_projection         :  Array   # (embed_dim, embed_dim)                  (D,D)
+    mm_soft_embedding_norm      :  Array   # (embed_dim,)                            (D,)
+    final_norm_scale             :  Array   # (embed_dim,)                            (D,)
+    blocks                      :  tuple[Layer, ...]
+# fmt: on
 
+# -----------------------------------------------------------------------------
+# Param-to-pytree conversions
+# -----------------------------------------------------------------------------
 
-# --- Create Gemma3 model ---
-def initialize_model(params: FlatDict, num_layers: int, config: Config | None = None) -> Gemma3:
-  """Load and instantiate the Gemma3 model. This is essential an ordered dictionary of parameters."""
-  return Gemma3(
-      params["transformer.embedder.input_embedding"],
-      params["transformer.embedder.mm_input_projection.w"],
-      params["transformer.embedder.mm_soft_embedding_norm.scale"],
-      params["transformer.final_norm.scale"],
-      [
-          Layer(
-              params[f"transformer.layer_{idx}.attn._key_norm.scale"],
-              params[f"transformer.layer_{idx}.attn._query_norm.scale"],
-              params[f"transformer.layer_{idx}.attn.attn_vec_einsum.w"],
-              params[f"transformer.layer_{idx}.attn.kv_einsum.w"],
-              params[f"transformer.layer_{idx}.attn.q_einsum.w"],
-              params[f"transformer.layer_{idx}.mlp.gating_einsum.w"],
-              params[f"transformer.layer_{idx}.mlp.linear.w"],
-              params[f"transformer.layer_{idx}.post_attention_norm.scale"],
-              params[f"transformer.layer_{idx}.post_ffw_norm.scale"],
-              params[f"transformer.layer_{idx}.pre_attention_norm.scale"],
-              params[f"transformer.layer_{idx}.pre_ffw_norm.scale"],
-          )
-          for idx in range(num_layers)
-      ],
-  )
+def _build_model_pytree(params: FlatDict, *, num_layers: int) -> Gemma3:
+    def _layer(idx: int) -> Layer:
+        p = f"transformer.layer_{idx}."
+        return Layer(
+            params[p + "attn._key_norm.scale"],
+            params[p + "attn._query_norm.scale"],
+            params[p + "attn.attn_vec_einsum.w"],
+            params[p + "attn.kv_einsum.w"],
+            params[p + "attn.q_einsum.w"],
+            params[p + "mlp.gating_einsum.w"],
+            params[p + "mlp.linear.w"],
+            params[p + "post_attention_norm.scale"],
+            params[p + "post_ffw_norm.scale"],
+            params[p + "pre_attention_norm.scale"],
+            params[p + "pre_ffw_norm.scale"],
+        )
 
-
-# --- Param/ Pytree Utility Functions ---
-def handle_key(k: Any) -> str:
-  """Extract a string representation from various key types used in Pytrees."""
-  if hasattr(k, "idx"):
-    return str(k.idx)
-  elif hasattr(k, "key"):
-    return k.key
-  elif hasattr(k, "name"):
-    return k.name
-  else:
-    return str(k)
-
-
-def get_key(k: Union[tuple[Any, ...], Any], replace_str: str = "", with_str: str = "") -> str:
-  key = ".".join([handle_key(x) for x in k]) if isinstance(k, tuple) else handle_key(k)
-  return key.replace(replace_str, with_str) if replace_str else key
-
-
-def flatten_nested_pytree(tree: Any) -> FlatDict:
-  flat, _ = jax.tree_util.tree_flatten_with_path(tree)
-  return {get_key(k): v for k, v in flat}
-
-
-# --- PartitionSpecs for Model ---
-def get_params_partition_spec_as_dict(config: Config) -> dict[str, Any]:
-  """Get the PartitionSpec Pytree matching the raw params dictionary."""
-  embed_spec = P(None, "model")
-  norm_spec = P()  # Replicated
-
-  # For each layer in the transformer block
-  layer_spec = {
-      "attn_key_norm_scale": norm_spec,
-      "attn_query_norm_scale": norm_spec,
-      "output_proj": P(None, None, "model"),
-      "kv_proj": P(None, None, "model", None),  # [2,K,D,H]
-      "q_proj": P(None, "model", None),  # [H,D,K]
-      "gating_weights": P(None, "model", None),  # [2,F,D]
-      "output_weights": P("model", None),
-      "post_attention_norm_scale": norm_spec,
-      "post_ffw_norm_scale": norm_spec,
-      "pre_attention_norm_scale": norm_spec,
-      "pre_ffw_norm_scale": norm_spec,
-  }
-  # Build a pytree matching your Gemma3 named tuple structure.
-  params_spec = {
-      "input_embedding_table": embed_spec,
-      "mm_input_projection": embed_spec,
-      "mm_soft_embedding_norm": norm_spec,
-      "final_norm_scale": norm_spec,
-      "blocks": [layer_spec] * config.num_layers,
-  }
-  return params_spec
-
-
-def remap_params(params: FlatDict, num_layers: int, config: Config | None = None) -> NestedDict:
-  """Remap the raw flat params dictionary into a shallowly nested parameters dictionary."""
-
-  p = {}
-  p["input_embedding_table"] = params["transformer.embedder.input_embedding"]
-  p["mm_input_projection"] = params["transformer.embedder.mm_input_projection.w"]
-  p["mm_soft_embedding_norm"] = params["transformer.embedder.mm_soft_embedding_norm.scale"]
-  p["final_norm_scale"] = params["transformer.final_norm.scale"]
-  p["blocks"] = [
-      {
-          "attn_key_norm_scale": params[f"transformer.layer_{idx}.attn._key_norm.scale"],
-          "attn_query_norm_scale": params[f"transformer.layer_{idx}.attn._query_norm.scale"],
-          "output_proj": params[f"transformer.layer_{idx}.attn.attn_vec_einsum.w"],
-          "kv_proj": params[f"transformer.layer_{idx}.attn.kv_einsum.w"],
-          "q_proj": params[f"transformer.layer_{idx}.attn.q_einsum.w"],
-          "gating_weights": params[f"transformer.layer_{idx}.mlp.gating_einsum.w"],
-          "output_weights": params[f"transformer.layer_{idx}.mlp.linear.w"],
-          "post_attention_norm_scale": params[f"transformer.layer_{idx}.post_attention_norm.scale"],
-          "post_ffw_norm_scale": params[f"transformer.layer_{idx}.post_ffw_norm.scale"],
-          "pre_attention_norm_scale": params[f"transformer.layer_{idx}.pre_attention_norm.scale"],
-          "pre_ffw_norm_scale": params[f"transformer.layer_{idx}.pre_ffw_norm.scale"],
-      }
-      for idx in range(num_layers)
-  ]
-  return p
-
-
-def get_params_partition_spec(config: Config) -> Gemma3:
-  """Get the PartitionSpec Pytree matching the Gemma3 NamedTuple."""
-  # Shard embedding dim ('model'), replicate norms ()
-  embed_spec = P(None, "model")
-  norm_spec = P()  # Replicated
-
-  layer_spec = Layer(
-      attn_key_norm_scale=norm_spec,  # Replicate (head_dim,)
-      attn_query_norm_scale=norm_spec,  # Replicate (head_dim,)
-      output_proj=P(None, None, "model"),  # Shard embed_dim (num_heads, head_dim, embed_dim)
-      kv_proj=P(None, None, "model", None),  # Shard embed_dim(D) (2, K, D, H)
-      q_proj=P(None, "model", None),  # Shard hidden_dim (2, hidden_dim, embed_dim)
-      gating_weights=P(None, "model", None),  # Shard hidden_dim (2, hidden_dim, embed_dim)
-      output_weights=P("model", None),  # Shard hidden_dim (hidden_dim, embed_dim)
-      post_attention_norm_scale=norm_spec,  # Replicate (embed_dim,)
-      post_ffw_norm_scale=norm_spec,  # Replicate (embed_dim,)
-      pre_attention_norm_scale=norm_spec,  # Replicate (embed_dim,)
-      pre_ffw_norm_scale=norm_spec,  # Replicate (embed_dim,)
-  )
-  return Gemma3(
-      # Shard embed_dim (vocab_size, embed_dim)
-      input_embedding_table=embed_spec,
-      final_norm_scale=norm_spec,  # Replicate (embed_dim,)
-      mm_input_projection=embed_spec,  # Replicate (embed_dim, embed_dim)
-      mm_soft_embedding_norm=norm_spec,  # Replicate (embed_dim,)
-      blocks=[layer_spec] * config.num_layers,
-  )
-
-
-# --- Device Mesh Creation ---
-def create_device_mesh(
-    mesh_shape: tuple[int | None, int | None] | None = None,
-    axis_names: tuple[str, str] = ("data", "model"),
-) -> Mesh:
-  """
-  Build a 2-D Mesh that is TPU agnostic.
-
-  Examples:
-  create_device_mesh()                 # auto for v2-8, v4-32, v4-64
-  create_device_mesh((8, 1))           # data-parallel only
-  create_device_mesh((None, 4))        # force 4-way model parallelism
-  """
-  devices = jax.devices()
-  num_devices = len(devices)
-
-  if mesh_shape is None or mesh_shape == (None, None):
-    # Factorization
-    side = int(math.sqrt(num_devices))
-    while side > 1 and num_devices % side:
-      side -= 1
-    batch_axis = side
-    model_axis = num_devices // side
-  else:
-    batch_axis, model_axis = mesh_shape
-
-    # Fill-in any None using what’s left.
-    if batch_axis is None and model_axis is None:
-      raise ValueError("mesh_shape cannot be (None, None); use None instead.")
-
-    if batch_axis is None:
-      if num_devices % model_axis:
-        raise ValueError(f"Cannot put {num_devices} devices into (_, {model_axis}).")
-      batch_axis = num_devices // model_axis
-
-    if model_axis is None:
-      if num_devices % batch_axis:
-        raise ValueError(f"Cannot put {num_devices} devices into ({batch_axis}, _).")
-      model_axis = num_devices // batch_axis
-
-  required = batch_axis * model_axis
-  if required > num_devices:
-    raise ValueError(
-        f"Need {required} devices for mesh ({batch_axis}×{model_axis}), " f"but only {num_devices} are available."
+    return Gemma3(
+        params["transformer.embedder.input_embedding"],
+        params["transformer.embedder.mm_input_projection.w"],
+        params["transformer.embedder.mm_soft_embedding_norm.scale"],
+        params["transformer.final_norm.scale"],
+        tuple(_layer(i) for i in range(num_layers)),
     )
 
-  mesh_array = np.array(devices[:required]).reshape((batch_axis, model_axis))
 
-  print(
-      f"Creating mesh {mesh_array.shape} on {jax.device_count()} physical devices "
-      f"(hosts={jax.process_count()}) → axes{axis_names}"
-  )
-  return Mesh(mesh_array, axis_names=axis_names)
+# fmt: off
+def _build_shallow_dict(params: FlatDict, *, num_layers: int) -> NestedDict:
+    """Return a 2-level dict mirroring the NamedTuple but easy to JSON-dump."""
+    out: NestedDict = {
+        "input_embedding_table"         : params["transformer.embedder.input_embedding"],
+        "mm_input_projection"           : params["transformer.embedder.mm_input_projection.w"],
+        "mm_soft_embedding_norm"        : params["transformer.embedder.mm_soft_embedding_norm.scale"],
+        "final_norm_scale"               : params["transformer.final_norm.scale"],
+        "blocks"                        : [],
+    }
+    for i in range(num_layers):
+        p = f"transformer.layer_{i}."
+        out["blocks"].append({
+            "attn_key_norm_scale"       : params[p + "attn._key_norm.scale"],
+            "attn_query_norm_scale"     : params[p + "attn._query_norm.scale"],
+            "output_proj"               : params[p + "attn.attn_vec_einsum.w"],
+            "kv_proj"                   : params[p + "attn.kv_einsum.w"],
+            "q_proj"                    : params[p + "attn.q_einsum.w"],
+            "gating_weights"            : params[p + "mlp.gating_einsum.w"],
+            "output_weights"            : params[p + "mlp.linear.w"],
+            "post_attention_norm_scale" : params[p + "post_attention_norm.scale"],
+            "post_ffw_norm_scale"       : params[p + "post_ffw_norm.scale"],
+            "pre_attention_norm_scale"  : params[p + "pre_attention_norm.scale"],
+            "pre_ffw_norm_scale"        : params[p + "pre_ffw_norm.scale"],
+        })
+    return out
+# fmt: on
 
+# -----------------------------------------------------------------------------
+# Sharding wrappers
+# -----------------------------------------------------------------------------
 
-# --- Model Loading ---
-def load_and_format_raw_params(path: str, load_siglip: bool = False, dtype: jnp.dtype | None = None) -> FlatDict:
-  """Load parameters from a checkpoint and returns a flat dictionary.
+def _device_put_with_spec(pytree: _T, spec_tree: _T, mesh: Mesh) -> _T:
+    sharding = jax.tree_util.tree_map(lambda s: NamedSharding(mesh, s), spec_tree)
+    return jax.device_put(pytree, sharding)
 
-  Remaps keys (replacing "/" with ".") and optionally excludes SigLIP keys.
-  Optionally casts parameters to the specified dtype.
-  """
+# -----------------------------------------------------------------------------
+# Public loading API
+# -----------------------------------------------------------------------------
 
-  @functools.cache
-  def _load_params(p: str) -> Any:
-    checkpointer = ocp.PyTreeCheckpointer()
-    return checkpointer.restore(p)
+def load_model(path: str | Path, mesh: Mesh, cfg: Config, *, dtype: jnp.dtype | None = None) -> Gemma3:
+    """Load → build NamedTuple → shard → return."""
+    t0 = time.perf_counter()
+    flat = _load_flat_params(path, dtype=dtype)
+    _logger.info("Params loaded in %.2fs", time.perf_counter() - t0)
 
-  def _remap_fn(key: str) -> str:
-    return key.replace("/", ".")
+    model_pt = _build_model_pytree(flat, num_layers=cfg.num_layers)
+    spec_pt = _model_spec(cfg)
 
-  print(f"Loading raw parameters from: {path}")
-  params = _load_params(path)
-  flat_params = flatten_nested_pytree(params)
-
-  if not load_siglip:
-    print("Removing top-level 'SigLiPFromPatches_0' key.")
-    flat_params = {k: v for k, v in flat_params.items() if not k.startswith("SigLiPFromPatches_0")}
-
-  remapped_params = {_remap_fn(k): v for k, v in flat_params.items()}
-
-  if dtype:
-    print(f"Casting parameters to {dtype}...")
-    start_cast_time = time.time()
-    remapped_params = jax.tree_util.tree_map(lambda x: x.astype(dtype), remapped_params)
-    print(f"Parameter casting complete in {time.time() - start_cast_time:.2f}s")
-
-  return remapped_params
-
-
-def load_model(path: str, mesh: Mesh, config: Config, dtype: jnp.dtype | None = None) -> Gemma3:
-  """Load parameters from checkpoint, structures them into a Gemma3 NamedTuple,.
-
-  and shards the model across the provided device mesh.
-  Args:
-      path: Path to the checkpoint directory.
-      mesh: The JAX device mesh for sharding.
-      config: The model configuration.
-      dtype: Optional dtype to cast parameters to (e.g., jnp.bfloat16).
-
-  Returns:
-      The sharded Gemma3 model Pytree.
-  Raises:
-      ValueError: If parameter structuring fails.
-  """
-  start_time = time.time()
-  raw_flat_params = load_and_format_raw_params(path, load_siglip=False, dtype=dtype)
-  print(f"Parameter loading complete in {time.time() - start_time:.2f}s")
-
-  start_time = time.time()
-  try:
-    model_tree = initialize_model(raw_flat_params, num_layers=config.num_layers)
-  except ValueError as e:
-    print(f"Parameter conversion failed: {e}")
-    raise
-  print(f"Model structuring complete in {time.time() - start_time:.2f}s")
-
-  params_spec = get_params_partition_spec(config)
-  target_sharding = jax.tree_util.tree_map(lambda spec: NamedSharding(mesh, spec), params_spec)
-
-  print("Sharding model...")
-  start_time = time.time()
-
-  def _shard(pytree: Any) -> Any:
-    return jax.device_put(pytree, target_sharding)
-
-  with mesh:
-    sharded_model = _shard(model_tree)
-    # Ensure the embedding table is ready
-    sharded_model.input_embedding_table.block_until_ready()
-  print(f"Model sharding complete in {time.time() - start_time:.2f}s")
-  return sharded_model
+    _logger.info("Sharding model …")
+    t0 = time.perf_counter()
+    with mesh:
+        sharded = _device_put_with_spec(model_pt, spec_pt, mesh)
+        sharded.input_embedding_table.block_until_ready()
+    _logger.info("Done (%.2fs)", time.perf_counter() - t0)
+    return sharded
 
 
-def load_params(path: str, mesh: Mesh, config: Config, dtype: jnp.dtype | None = None) -> NestedDict:
-  """Load parameters from checkpoint, structures them into a shallowly nested parameters dictionary,
-  and shards the parameters across the provided device mesh.
+def load_params(path: str | Path, mesh: Mesh, cfg: Config, *, dtype: jnp.dtype | None = None) -> NestedDict:
+    """Load → shallow dict → shard → return."""
+    t0 = time.perf_counter()
+    flat = _load_flat_params(path, dtype=dtype)
+    _logger.info("Params loaded in %.2fs", time.perf_counter() - t0)
 
-  Args:
-      path: Path to the checkpoint directory.
-      mesh: The JAX device mesh for sharding.
-      config: The model configuration.
-      dtype: Optional dtype to cast parameters to (e.g., jnp.bfloat16).
+    nested = _build_shallow_dict(flat, num_layers=cfg.num_layers)
+    pspec = _param_spec_dict(cfg)
 
-  Returns:
-      The sharded parameters dictionary.
-  Raises:
-      ValueError: If parameter structuring fails.
-  """
-  start_time = time.time()
-  raw_flat_params = load_and_format_raw_params(path, load_siglip=False, dtype=dtype)
-  print(f"Parameter loading complete in {time.time() - start_time:.2f}s")
+    _logger.info("Sharding param-dict …")
+    t0 = time.perf_counter()
+    with mesh:
+        sharded = _device_put_with_spec(nested, pspec, mesh)
+        sharded["input_embedding_table"].block_until_ready()
+    _logger.info("Done (%.2fs)", time.perf_counter() - t0)
+    return sharded
 
-  start_time = time.time()
-  try:
-    params_tree = remap_params(raw_flat_params, num_layers=config.num_layers)
-  except ValueError as e:
-    print(f"Parameter conversion failed: {e}")
-    raise
-  print(f"Parameter structuring complete in {time.time() - start_time:.2f}s")
+def load_unsharded_model(path: str | Path, cfg: Config, *, dtype: jnp.dtype | None = None) -> Gemma3:
+    """Load → build NamedTuple → return."""
+    t0 = time.perf_counter()
+    flat = _load_flat_params(path, dtype=dtype)
+    _logger.info("Params loaded in %.2fs", time.perf_counter() - t0)
 
-  params_spec = get_params_partition_spec_as_dict(config)
-  target_sharding = jax.tree_util.tree_map(lambda spec: NamedSharding(mesh, spec), params_spec)
+    model_pt = _build_model_pytree(flat, num_layers=cfg.num_layers)
+    _logger.info("Done (%.2fs)", time.perf_counter() - t0)
+    return model_pt
 
-  print("Sharding parameters...")
-  start_time = time.time()
+def load_unsharded_params(path: str | Path, cfg: Config, *, dtype: jnp.dtype | None = None, flatten: bool=False) -> NestedDict:
+    """Load → shallow dict  → return."""
+    t0 = time.perf_counter()
+    flat = _load_flat_params(path, dtype=dtype)
+    _logger.info("Params loaded in %.2fs", time.perf_counter() - t0)
 
-  def _shard(pytree: Any) -> Any:
-    return jax.device_put(pytree, target_sharding)
+    nested = _build_shallow_dict(flat, num_layers=cfg.num_layers)
+    if flatten:
+        flattened = _flatten_pytree_with_dots(nested)
+        _logger.info("Flattened to %d keys", len(flattened))
+        _logger.info("Done (%.2fs)", time.perf_counter() - t0)
 
-  with mesh:
-    params = _shard(params_tree)
-    # Ensure the embedding table is ready
-    params["input_embedding_table"].block_until_ready()
-  print(f"Parameter sharding complete in {time.time() - start_time:.2f}s")
-  return params
+        return flattened
+    _logger.info("Nested dict with %d keys", len(nested))
+    _logger.info("Done (%.2fs)", time.perf_counter() - t0)
+    return nested
+
+
+
+# -----------------------------------------------------------------------------
+# PartitionSpec templates (NamedTuple PYTree)
+# -----------------------------------------------------------------------------
+
+class LayerPSpec(NamedTuple):
+    attn_key_norm_scale: P
+    attn_query_norm_scale: P
+    output_proj: P
+    kv_proj: P
+    q_proj: P
+    gating_weights: P
+    output_weights: P
+    post_attention_norm_scale: P
+    post_ffw_norm_scale: P
+    pre_attention_norm_scale: P
+    pre_ffw_norm_scale: P
+
+
+class Gemma3PSpec(NamedTuple):
+    input_embedding_table: P
+    mm_input_projection: P
+    mm_soft_embedding_norm: P
+    final_norm_scale: P
+    blocks: tuple[LayerPSpec, ...]
+
+
+# lazy constants
+_norm = P()
+_emb = P(None, "model")
+
+
+def _layer_spec() -> Layer:
+    return Layer(
+        _norm,
+        _norm,
+        P(None, None, "model"),
+        P(None, None, "model", None),
+        P(None, "model", None),
+        P(None, "model", None),
+        P("model", None),
+        _norm,
+        _norm,
+        _norm,
+        _norm,
+    )
+
+
+def _model_spec(cfg: Config) -> Gemma3:
+    return Gemma3(_emb, _emb, _norm, _norm, tuple(_layer_spec() for _ in range(cfg.num_layers)))
+
+
+# -----------------------------------------------------------------------------
+# Param-spec as dict (for load_params)
+# -----------------------------------------------------------------------------
+
+# fmt: off
+def _param_spec_dict(cfg: Config) -> NestedDict:
+    norm, emb = _norm, _emb
+    layer = {
+        "attn_key_norm_scale"       : norm,
+        "attn_query_norm_scale"     : norm,
+        "output_proj"               : P(None, None, "model"),
+        "kv_proj"                   : P(None, None, "model", None),
+        "q_proj"                    : P(None, "model", None),
+        "gating_weights"            : P(None, "model", None),
+        "output_weights"            : P("model", None),
+        "post_attention_norm_scale" : norm,
+        "post_ffw_norm_scale"       : norm,
+        "pre_attention_norm_scale"  : norm,
+        "pre_ffw_norm_scale"        : norm,
+    }
+    return {
+        "input_embedding_table"     : emb,
+        "mm_input_projection"       : emb,
+        "mm_soft_embedding_norm"    : norm,
+        "final_norm_scale"           : norm,
+        "blocks"                    : [layer] * cfg.num_layers,
+    }
+# fmt: on
+# %%

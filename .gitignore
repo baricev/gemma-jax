@@ -106,6 +106,7 @@ data/
 # Model directories
 model/
 4b/
+4b
 
 # Test code directories
 _*/

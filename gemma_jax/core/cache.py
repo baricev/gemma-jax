@@ -1,285 +1,292 @@
+# %%
 """
-KV-cache utilities for Gemma-3 in functional JAX style.
-
-The module exposes two public helpers:
-
-- `init_cache` - allocate and shard an empty cache
-- `update_cache_layer` - in-place update of a **single** layer's key/value slice
-- `update_cache_layers` - in-place update of **multiple** layers key/value slices
-
-All layout-specific logic is compiled once up-front, so the hot path that runs
-inside `self_attention` contains no Python conditionals and is fully
-jax.jit/jax.pmap friendly.
+KV-cache utilities for Gemma‑3 in functional JAX style (fixed - no ring buffer).
 """
 
 from dataclasses import dataclass
-from enum import Enum, auto
-from typing import Tuple, Dict, Callable, Any, Final, NamedTuple, Literal
+from typing import Any, Optional
+from functools import partial
 
 import jax
 import jax.numpy as jnp
-from jax import Array
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from typing import NamedTuple
+from jax import Array, lax
+from jax.sharding import NamedSharding, PartitionSpec
 
+# ============================================================================
+# KVCache Data Structure
+# ============================================================================
 
-# NOTE: Both Layout Classes functionally equivalent.
-
-# LayoutType is an alias for int, used to represent the layout type of the cache.
-LayoutType = int
-
-
-def get_shape_map(config: Any) -> dict[str, int]:
-  """Return a dictionary mapping shape dimensions to their sizes."""
-  return {
-      "L": config.num_layers,
-      "B": config.batch_size,
-      "K": config.num_kv_heads,
-      "S": config.cache_length,
-      "H": config.head_dim,
-  }
-
-
-class Layout(NamedTuple):
-  """Allowed cache memory layouts."""
-
-  kind: int
-
-
-# Create Cache Layouts here (memory layout, sharding dimensions, and shape suffix names and mapping)
-"""Allowed cache memory layouts."""
-SEQUENCE_HEADS: Final[int] = 0  # [L, B, S, K, H]
-HEADS_SEQUENCE: Final[int] = 1  # [L, B, K, S, H]
-
-layout_map = {SEQUENCE_HEADS: ("L", "B", "S", "K", "H"), HEADS_SEQUENCE: ("L", "B", "K", "S", "H")}
-shard_dims = {SEQUENCE_HEADS: ("B", "K"), HEADS_SEQUENCE: ("K", "B")}
-aliases_map = {SEQUENCE_HEADS: "SEQUENCE_HEADS", HEADS_SEQUENCE: "HEADS_SEQUENCE"}
-SUPPORTED_LAYOUTS = [SEQUENCE_HEADS, HEADS_SEQUENCE]
-
-# Cache Layout Creation Functions
-
-
-def cache_shape(
-    kind: LayoutType,
-    config: Any,
-    layout_map: dict[LayoutType, tuple[str, ...]] = layout_map,
-    shard_dims: dict[LayoutType, tuple[str, ...]] = shard_dims,  # no op   [API compatibility]
-) -> tuple[int, ...]:
-  if not kind in SUPPORTED_LAYOUTS:
-    raise ValueError(f"Unsupported layout: {kind}")
-  shape_map = get_shape_map(config)
-
-  if hasattr(kind, "ordered_shapes"):
-    return tuple(shape_map[i] for i in kind.ordered_layout)  # pylint ignore
-  else:
-    return tuple(shape_map[i] for i in layout_map[kind])
-
-
-def cache_layout(
-    kind: LayoutType,
-    layout_map: dict[LayoutType, tuple[str, ...]] = layout_map,
-    shard_dims: dict[LayoutType, tuple[str, ...]] = shard_dims,  # no op
-) -> tuple[str, ...]:
-  if not kind in SUPPORTED_LAYOUTS:
-    raise ValueError(f"Unsupported layout: {kind}")
-  return layout_map[kind]
-
-
-def cache_spec(
-    kind,
-    mesh: Mesh,
-    layout_map: dict[LayoutType, tuple[str, ...]] = layout_map,
-    shard_dims: dict[LayoutType, tuple[str, ...]] = shard_dims,
-) -> P:
-  if not kind in SUPPORTED_LAYOUTS:
-    raise ValueError(f"Unsupported layout: {kind}")
-
-  partition_mapping = {k: v for k, v in zip(shard_dims[kind], mesh.axis_names)}
-  partition_mapping = {**partition_mapping, **layout_map}
-
-  if hasattr(kind, "ordered_shapes"):
-    partition_mapping = {k: v for k, v in zip(kind.shard_dims, mesh.axis_names)}
-    # return P(tuple(partition_mapping.get(k, None) for k in kind.ordered_layout ))
-    spec = tuple(partition_mapping.get(k, None) for k in kind.ordered_layout)
-  else:
-    spec = tuple(partition_mapping.get(k, None) for k in partition_mapping[kind])
-
-  assert (
-      len(spec) != 1
-  ), "Partition spec must have at least 2 dimensions. Is it nested?"  # ensure spec tuple is not wrapped in a tuple
-  return P(*spec)
-
-
-def cache_spec_map(
-    kind,
-    mesh: Mesh,
-    layout_map: dict[LayoutType, tuple[str, ...]] = layout_map,
-    shard_dims: dict[LayoutType, tuple[str, ...]] = shard_dims,
-) -> dict[str, Any]:
-  if not kind in SUPPORTED_LAYOUTS:
-    raise ValueError(f"Unsupported layout: {kind}")
-
-  partition_mapping = {k: v for k, v in zip(shard_dims[kind], mesh.axis_names)}
-  partition_mapping = {**partition_mapping, **layout_map}
-
-  if hasattr(kind, "ordered_shapes"):
-    partition_mapping = {k: v for k, v in zip(kind.shard_dims, mesh.axis_names)}
-
-  return {k: partition_mapping.get(k, None) for k in partition_mapping[kind]}
-
-
-def layout_by_name(
-    name: LayoutType,
-    _ALIASES: dict[LayoutType, str] = aliases_map,
-) -> str:
-  try:
-    return _ALIASES[name]
-  except KeyError as exc:
-    raise ValueError(f"Unknown layout: {name}. Supported: {SUPPORTED_LAYOUTS}") from exc
-
-
-# PyTree container
 @jax.tree_util.register_pytree_node_class
 @dataclass
 class KVCache:
-  """Sharded key/value tensors. Outermost dimension is layer."""
+    """Sharded key/value tensors for transformer attention.
 
-  key: Array
-  value: Array
+    Attributes:
+      key: Cached keys, shape (num_layers, batch, max_seq_len, num_kv_heads, head_dim)
+      value: Cached values, same shape as key
+      sequence_lengths: Valid sequence length per batch element, shape (batch,)
+      write_positions: Next write position per batch element, shape (batch,)
+    """
 
-  def tree_flatten(self):
-    return (self.key, self.value), None
+    key: Array  # (L, B, S, K, H)
+    value: Array  # (L, B, S, K, H)
+    sequence_lengths: Array  # (B,)
+    write_positions: Array  # (B,)
 
-  @classmethod
-  def tree_unflatten(cls, _, leaves):
-    key, value = leaves
-    return cls(key, value)
+    # ──────────────────────────────────────────────────────────────────────
+    # pytree helpers
+    # ──────────────────────────────────────────────────────────────────────
+    def tree_flatten(self):
+        return (self.key, self.value, self.sequence_lengths, self.write_positions), None
+
+    @classmethod
+    def tree_unflatten(cls, _, leaves):
+        return cls(*leaves)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # convenience
+    # ──────────────────────────────────────────────────────────────────────
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self.key.shape
+
+    @property
+    def batch_size(self) -> int:
+        return self.key.shape[1]
+
+    @property
+    def max_seq_len(self) -> int:
+        return self.key.shape[2]
+
+    @property
+    def num_layers(self) -> int:
+        return self.key.shape[0]
 
 
-# Public API helpers
+# ============================================================================
+# Public API
+# ============================================================================
+
+
 def init_cache(
     *,
-    mesh: Mesh,
-    config: Any,  # expects .num_layers .batch_size .num_kv_heads .cache_length .head_dim
+    batch: int,
+    max_seq_len: int,
+    num_layers: int,
+    num_kv_heads: int,
+    head_dim: int,
     dtype: jnp.dtype = jnp.bfloat16,
-    kind: LayoutType = HEADS_SEQUENCE,
-    layout_map: dict[LayoutType, tuple[str, ...]] = layout_map,
-    shard_dims: dict[LayoutType, tuple[str, ...]] = shard_dims,
-    aliases_map: dict[LayoutType, str] = aliases_map,
 ) -> KVCache:
-  """Allocate an uninitialized, correctly sharded KV cache."""
-  shape_map = get_shape_map(config)
+    """Allocate an initialized KV cache."""
 
-  shape = cache_shape(kind, config, layout_map, shard_dims)
-  ps = cache_spec(kind, mesh, layout_map, shard_dims)
-  suffixes = cache_layout(kind, layout_map, shard_dims)
-  sharding = NamedSharding(mesh, ps)
+    cache_shape = (num_layers, batch, max_seq_len, num_kv_heads, head_dim)
+    zeros = lambda shape: jnp.zeros(shape, dtype=dtype)
 
-  layout_name = layout_by_name(kind, aliases_map)
-  print(f"Initializing {layout_name} cache with shape {shape}")
-
-  print(f"Cache shape {shape}, partition spec {ps}")
-  print(f"Sharding cache with shape {shape} using partition spec: {sharding}")
-  print(f"Sharding {layout_name} across {cache_spec_map(kind, mesh)}")
-
-  empty = lambda: jax.device_put(jnp.empty(shape, dtype=dtype), sharding)
-  return KVCache(empty(), empty())
+    return KVCache(
+        key=zeros(cache_shape),
+        value=zeros(cache_shape),
+        sequence_lengths=jnp.zeros((batch,), dtype=jnp.int32),
+        write_positions=jnp.zeros((batch,), dtype=jnp.int32),
+    )
 
 
-# Layout-specialized update kernels
-UpdateFn = Callable[[Array, Array, Array, Array, int], Tuple[Array, Array]]
+def create_cache_partition_spec(key: str, mesh_axes: dict[str, str]) -> PartitionSpec:
+    """Return a PartitionSpec for any KVCache field."""
+
+    if key in ("key", "value"):
+        return PartitionSpec(None, mesh_axes.get("batch"), None, mesh_axes.get("heads"), None)
+    if key in ("sequence_lengths", "write_positions"):
+        return PartitionSpec(mesh_axes.get("batch"))
+    return PartitionSpec()
 
 
-def _make_update_fn(kind: LayoutType) -> UpdateFn:
-  """Build a jitted function that writes one (B,T,K,H) slice for key and value."""
+def shard_kvcache_with_tree_map(cache: KVCache, mesh: Any, mesh_axes: dict[str, str]) -> KVCache:
+    """Shard each field of the KVCache according to a per‑field spec."""
 
-  @jax.jit
-  def _update(key_slice: Array, val_slice: Array, key_proj: Array, value_proj: Array, write_index: int):
-    if kind == SEQUENCE_HEADS:  # [B, S, K, H]
-      key_update = jax.lax.dynamic_update_slice(key_slice, key_proj, (0, write_index, 0, 0))
-      val_update = jax.lax.dynamic_update_slice(val_slice, value_proj, (0, write_index, 0, 0))
-    else:  # HEADS_SEQUENCE [B, K, S, H]
-      key_t = jnp.transpose(key_proj, (0, 2, 1, 3))
-      val_t = jnp.transpose(value_proj, (0, 2, 1, 3))
-      key_update = jax.lax.dynamic_update_slice(key_slice, key_t, (0, 0, write_index, 0))
-      val_update = jax.lax.dynamic_update_slice(val_slice, val_t, (0, 0, write_index, 0))
-    return key_update, val_update
+    def put(x: Array, field: str) -> Array:
+        spec = create_cache_partition_spec(field, mesh_axes)
+        return jax.device_put(x, NamedSharding(mesh, spec))
 
-  return _update
+    return KVCache(
+        key=put(cache.key, "key"),
+        value=put(cache.value, "value"),
+        sequence_lengths=put(cache.sequence_lengths, "sequence_lengths"),
+        write_positions=put(cache.write_positions, "write_positions"),
+    )
 
 
-# Compile both kernels once
-_UPDATE_FNS: Dict[LayoutType, UpdateFn] = {
-    cache_layout: _make_update_fn(cache_layout) for cache_layout in (SEQUENCE_HEADS, HEADS_SEQUENCE)
-}
+# ============================================================================
+# Cache update helpers
+# ============================================================================
 
 
-def update_cache_layer_by_layer(
-    cache_layer: tuple[Array, Array],
-    key_proj: Array,
-    value_proj: Array,
-    *,
-    write_index: int,
-    layer: int,
-    kind: LayoutType = HEADS_SEQUENCE,
+def _update_ragged(
+    key_cache_layer: Array,   # (B, S, K, H)
+    val_cache_layer: Array,   # (B, S, K, H)
+    key_proj: Array,          # (B, 1, K, H) or (B, K, H)
+    value_proj: Array,        # (B, 1, K, H) or (B, K, H)
+    write_pos_B: Array,       # (B,)
 ) -> tuple[Array, Array]:
-  """
-  Functional in-place update for a single layer.
+    """Single‑token (generation) update for ragged batches."""
 
-  Returns a new cache layer (tuple consiting of the new key, and value arrays).
-  Does *not* return a new KVCache.
-  """
-  # Bounds checking
-  cache_key, cache_value = cache_layer
-  if not (0 <= layer < cache_key.shape[0]):
-    raise ValueError(f"Layer {layer} out of bounds [0, {cache_key.shape[0]})")
+    # Squeeze T‑dimension if present
+    if key_proj.ndim == 4:  # (B, 1, K, H)
+        key_proj = jnp.squeeze(key_proj, axis=1)
+        value_proj = jnp.squeeze(value_proj, axis=1)
 
-  update_fn = _UPDATE_FNS[kind]
-  key_layer = jax.lax.dynamic_index_in_dim(cache_key, layer, keepdims=False)
-  val_layer = jax.lax.dynamic_index_in_dim(cache_value, layer, keepdims=False)
-  new_key_layer, new_val_layer = update_fn(key_layer, val_layer, key_proj, value_proj, write_index)
-  return new_key_layer, new_val_layer
+    def update_one(cache_k, cache_v, new_k, new_v, pos):
+        new_k = new_k[None, :, :]  # (1, K, H)
+        new_v = new_v[None, :, :]
+        cache_k = lax.dynamic_update_slice(cache_k, new_k, (pos, 0, 0))
+        cache_v = lax.dynamic_update_slice(cache_v, new_v, (pos, 0, 0))
+        return cache_k, cache_v
+
+    return jax.vmap(update_one)(key_cache_layer, val_cache_layer, key_proj, value_proj, write_pos_B)
 
 
+def _update_dense(
+    key_cache_layer: Array,   # (B, S, K, H)
+    val_cache_layer: Array,   # (B, S, K, H)
+    key_proj: Array,          # (B, T, K, H)
+    value_proj: Array,        # (B, T, K, H)
+    write_pos_B: Array,       # (B,)
+    seq_lens_B: Array,        # (B,)
+) -> tuple[Array, Array]:
+    """Chunk (prefill) update for dense sequences."""
+
+    batch_size, max_cache_len, _, _ = key_cache_layer.shape
+    timeline_len = key_proj.shape[1]
+
+    # Guard against over‑length chunks
+    if timeline_len > max_cache_len:
+        raise ValueError(f"Chunk length exceeds cache capacity ({timeline_len} > {max_cache_len})")
+
+    write_pos_B = write_pos_B.reshape(-1)
+    seq_lens_B = seq_lens_B.reshape(-1)
+
+    # Calculate positions (no wraparound)
+    token_positions = write_pos_B[:, None] + jnp.arange(timeline_len)[None, :]
+    
+    # Check for overflow
+    max_position = jnp.max(token_positions + seq_lens_B[:, None] - 1)
+    # if max_position >= max_cache_len:
+    #     raise ValueError(f"Cache overflow: trying to write to position {max_position} but cache size is {max_cache_len}")
+    
+    cache_indices = token_positions
+
+    valid_mask = jnp.arange(timeline_len)[None, :] < seq_lens_B[:, None]
+    cache_indices = jnp.where(valid_mask, cache_indices, -1)
+
+    batch_indices = jnp.arange(batch_size)[:, None]
+    batch_indices = jnp.broadcast_to(batch_indices, cache_indices.shape)
+
+    updated_key = key_cache_layer.at[batch_indices, cache_indices].set(key_proj, mode="drop")
+    updated_val = val_cache_layer.at[batch_indices, cache_indices].set(value_proj, mode="drop")
+
+    return updated_key, updated_val
+
+
+# ============================================================================
+# Public updater
+# ============================================================================
+
+
+@partial(jax.jit, static_argnames=("layer", "ragged"))
 def update_cache_layer(
-    cache: KVCache, key_proj: Array, value_proj: Array, *, write_index: int, layer: int, kind: LayoutType = HEADS_SEQUENCE
-) -> tuple[Array, Array, KVCache]:
-  """Functional in-place update for a single layer. Returns new KVCache."""
-  # Bounds checking
-  if not (0 <= layer < cache.key.shape[0]):
-    raise ValueError(f"Layer {layer} out of bounds [0, {cache.key.shape[0]})")
-
-  update_fn = _UPDATE_FNS[kind]
-  key_layer = jax.lax.dynamic_index_in_dim(cache.key, layer, keepdims=False)
-  val_layer = jax.lax.dynamic_index_in_dim(cache.value, layer, keepdims=False)
-  new_key_layer, new_val_layer = update_fn(key_layer, val_layer, key_proj, value_proj, write_index)
-  key = cache.key.at[layer].set(new_key_layer)
-  value = cache.value.at[layer].set(new_val_layer)
-  return new_key_layer, new_val_layer, KVCache(key, value)
-
-
-def update_cache_layers(
     cache: KVCache,
-    key_proj: Array,
-    value_proj: Array,
+    key_proj: Array,      # (B, T, K, H)
+    value_proj: Array,    # (B, T, K, H)
     *,
-    write_index: int,
-    layers: list[int],
-    kind: LayoutType = HEADS_SEQUENCE,
-) -> KVCache:
-  """Functional in-place update for multiple layers. Returns new KVCache."""
-  update_fn = _UPDATE_FNS[kind]
-  key, value = cache.key, cache.value
+    write_pos_B: Array,   # (B,) or scalar
+    seq_lens_B: Array,    # (B,) or scalar (tokens being written)
+    layer: int,
+    ragged: bool = False,
+):
+    """Update one layer of the KV cache and return (key_layer, value_layer, new_cache)."""
 
-  # Bounds checking
-  for layer in layers:
-    if not (0 <= layer < cache.key.shape[0]):
-      raise ValueError(f"Layer {layer} out of bounds [0, {cache.key.shape[0]})")
+    if not 0 <= layer < cache.num_layers:
+        raise ValueError(f"Layer {layer} out of bounds [0, {cache.num_layers})")
 
-  for layer in layers:
-    key_layer = jax.lax.dynamic_index_in_dim(key, layer, keepdims=False)
-    val_layer = jax.lax.dynamic_index_in_dim(value, layer, keepdims=False)
-    new_key_layer, new_val_layer = update_fn(key_layer, val_layer, key_proj, value_proj, write_index)
-    key = key.at[layer].set(new_key_layer)
-    value = value.at[layer].set(new_val_layer)
-  return KVCache(key, value)
+    key_layer = cache.key[layer]
+    val_layer = cache.value[layer]
+
+    write_pos_B = jnp.asarray(write_pos_B)
+    seq_lens_B = jnp.asarray(seq_lens_B)
+
+    if write_pos_B.ndim == 0:
+        write_pos_B = jnp.broadcast_to(write_pos_B, (cache.batch_size,))
+    if seq_lens_B.ndim == 0:
+        seq_lens_B = jnp.broadcast_to(seq_lens_B, (cache.batch_size,))
+
+    if ragged or key_proj.shape[1] == 1:
+        updated_key, updated_val = _update_ragged(
+            key_layer, val_layer, key_proj, value_proj, write_pos_B
+        )
+    else:
+        updated_key, updated_val = _update_dense(
+            key_layer, val_layer, key_proj, value_proj, write_pos_B, seq_lens_B
+        )
+
+    # ── bookkeeping (no ring buffer) ──────────────────────────────────────
+    new_seq_lengths = jnp.maximum(
+        cache.sequence_lengths, write_pos_B + seq_lens_B
+    )
+    
+    new_write_pos = cache.write_positions + seq_lens_B  # No wraparound
+    
+
+    new_cache = KVCache(
+        key=cache.key.at[layer].set(updated_key),
+        value=cache.value.at[layer].set(updated_val),
+        sequence_lengths=new_seq_lengths,
+        write_positions=new_write_pos,
+    )
+
+    return updated_key, updated_val, new_cache
+
+
+# ============================================================================
+# Utility helpers
+# ============================================================================
+
+def get_valid_cache_positions(cache: KVCache) -> Array:
+    """Boolean mask of valid positions."""
+
+    positions = jnp.arange(cache.max_seq_len)[None, :]
+    return positions < cache.sequence_lengths[:, None]
+
+
+def reset_cache_positions(cache: KVCache, batch_indices: Optional[Array] = None) -> KVCache:
+    """Reset sequence length and write pointer for selected batch elements."""
+
+    if batch_indices is None:
+        new_len = jnp.zeros_like(cache.sequence_lengths)
+        new_pos = jnp.zeros_like(cache.write_positions)
+    else:
+        new_len = cache.sequence_lengths.at[batch_indices].set(0)
+        new_pos = cache.write_positions.at[batch_indices].set(0)
+
+    return KVCache(
+        key=cache.key,
+        value=cache.value,
+        sequence_lengths=new_len,
+        write_positions=new_pos,
+    )
+
+
+def cache_info_string(cache: KVCache) -> str:
+    """Return a human‑readable string summarising cache state."""
+
+    gb = (cache.key.nbytes + cache.value.nbytes) / 1024 ** 3
+    return (
+        f"KVCache Info:\n"
+        f"  Shape: {cache.shape}\n"
+        f"  Batch size: {cache.batch_size}\n"
+        f"  Max sequence length: {cache.max_seq_len}\n"
+        f"  Number of layers: {cache.num_layers}\n"
+        f"  Current sequence lengths: {cache.sequence_lengths.tolist()}\n"
+        f"  Current write positions: {cache.write_positions.tolist()}\n"
+        f"  Memory usage: {gb:.2f} GB"
+    )
+
+# %%

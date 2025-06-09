@@ -1,3 +1,4 @@
+#%%
 """Experimental RoPE (Rotary Positional Embedding) implementations for JAX.
 
 Examples included:
@@ -42,8 +43,7 @@ def apply_rope_cached(
   x1, x2 = jnp.split(x, 2, axis=-1)
   return jnp.concatenate([x1 * cos_vals - x2 * sin_vals, x2 * cos_vals + x1 * sin_vals], axis=-1).astype(x.dtype)
 
-
-def load_rope_cache(mesh: Mesh, config: Config) -> jax.Array:
+def init_rope_cache(config: Config) -> jax.Array:
   """Load the Rope cache for the given configuration."""
   if config.cache_length is None:
     raise ValueError("config.cache_length cannot be None for RoPE cache loading")
@@ -52,14 +52,28 @@ def load_rope_cache(mesh: Mesh, config: Config) -> jax.Array:
       config.cache_length,
       config.local_base_frequency,
       config.local_scale_factor,
+      # config.rope_base_frequency,
+      # config.rope_scale_factor,
   )
   global_rope = precompute_rope_embeddings(
       config.head_dim,
       config.cache_length,
       config.global_base_frequency,
       config.global_scale_factor,
+      # config.global_rope_base_frequency,
+      # config.global_rope_scale_factor,
   )
-  rope_cache = jnp.array([local_rope, global_rope])
+  return jnp.array([local_rope, global_rope])
+
+
+def load_rope_cache(mesh: Mesh, config: Config) -> jax.Array:
+  """Load the Rope cache for the given configuration."""
+  if config.cache_length is None:
+    raise ValueError("config.cache_length cannot be None for RoPE cache loading")
+
+  rope_cache = init_rope_cache(config)
+
+  # Shard the rope cache using the mesh and mesh_axes:
   rope_sharding = NamedSharding(mesh, P(None, None, "model", None))
   rope_cache = jax.device_put(rope_cache, rope_sharding)
   return rope_cache
@@ -113,17 +127,13 @@ def apply_rope_outer_product(
 
 
 # --- DeepMind RoPE implementation ---
-# from: https://github.com/google-deepmind/gemma/blob/main/gemma/gm/math/_positional_embeddings.py
-
-
+# apply_rope from: https://github.com/google-deepmind/gemma/blob/main/gemma/gm/math/_positional_embeddings.py
 def apply_rope(
     inputs: jax.Array,
     positions: jax.Array,
     *,
     base_frequency: int,
     scale_factor: float = 1.0,
-    sin_cache: jax.Array = None,
-    cos_cache: jax.Array = None,
 ) -> jax.Array:
   """Applies RoPE.
 
@@ -158,3 +168,5 @@ def apply_rope(
   second_part = second_half * cos + first_half * sin
   out = jnp.concatenate([first_part, second_part], axis=-1)
   return out.astype(inputs.dtype)
+
+# %%
