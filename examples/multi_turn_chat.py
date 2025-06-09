@@ -10,10 +10,14 @@
 
 # %%
 
+import os
+from pathlib import Path
+
 try:
   import google.colab
 
   IN_COLAB = True
+
 except ImportError:
   IN_COLAB = False
 
@@ -22,17 +26,19 @@ if IN_COLAB:
 
   drive.mount("/content/drive")
 
-  import os
-
-  os.chdir("/content/drive/My Drive/gemma-jax")
+  os.chdir('/content/gemma-jax')
   print(f"Running in Google Colab. Current directory: {os.getcwd()}")
-else:
-  import os
-  from pathlib import Path
 
+  root_dir = Path('/content/gemma-jax')
+  checkpoint_path =  Path("/content/drive/MyDrive/4b") # Absolute path to the Gemma model checkpoint
+else:
   home_dir = Path.home()
-  os.chdir(home_dir / "docs" / "gemma-jax-opus")
+  root_dir = Path.cwd()
+  checkpoint_path = root_dir / "4b"  # Absolute path to the Gemma model checkpoint
   print(f"Running locally. Current directory: {Path.cwd()}")
+
+# Set tokenizer path to the github directory
+tokenizer_path = root_dir / "tokenizer.model"  # Absolute path to SentencePiece tokenizer
 
 # %% [markdown]
 # ### Installation
@@ -47,13 +53,7 @@ else:
 #
 # Set the default paths and parameters. Adjust the paths to reflect your actual filesystem setup for the tokenizer and model checkpoints.
 
-# %%
-from pathlib import Path
-
-root_dir = Path.cwd()
-checkpoint_path = root_dir / "4b"  # Absolute path to the Gemma model checkpoint
-tokenizer_path = root_dir / "tokenizer.model"  # Absolute path to SentencePiece tokenizer
-
+# %
 assert tokenizer_path.exists(), f"Tokenizer path {tokenizer_path} does not exist."
 assert checkpoint_path.exists(), f"Checkpoint path {checkpoint_path} does not exist."
 
@@ -109,7 +109,7 @@ model_size = 4  # Model scale (e.g., 4 for 4B parameters)
 cache_length = 4096  # Length of KV-cache
 chunk_length = 1024  # Maximum input sequence length
 window_size = 1024  # Attention window size
-batch = 2  # Batch size for inference
+batch = 4  # Batch size for inference
 dtype_str = "bfloat16"  # Model precision: ['bfloat16', 'float16', 'float32']
 generate_steps = 1024  # Number of tokens generated after prefill
 
@@ -130,6 +130,7 @@ start_setup = time.time()
 if jax.devices()[0].device_kind == "cpu":
   print("Using CPU device settings.")
   cache_length, chunk_length, window_size,  batch, generate_steps = 1*1024, 1024, 1024, 4, 8
+  # cache_length, chunk_length, window_size,  batch, generate_steps = 128, 128, 128, 2, 8
   # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=1"
 
 mesh = create_device_mesh()  # Adjust the mesh shape based on the number of devices and TPU arch
@@ -190,7 +191,7 @@ long_prompts = [
 ]
 
 # prompts = [prompts[0], *long_prompts]  # Use only the first prompt for testing
-prompts = long_prompts * batch  # Repeat to match batch size
+# prompts = long_prompts * batch  # Repeat to match batch size
 prompts = (prompts *  batch)[: batch]
 formatted_prompts = [format_prompt(p) for p in prompts]
 
@@ -598,8 +599,8 @@ print(f"Setup generate completed in {time.time() - t0:.2f}s")
 
 # Time the generation
 t0 = time.time()
-total_tokens = 64 # Total number of tokens to generate
-run_chunk_size = 64 # Number of tokens to generate in each chunk
+total_tokens = 128 # Total number of tokens to generate
+run_chunk_size = 128 # Number of tokens to generate in each chunk
 _ = run_full_generation_with_chunked_callback(
     init_carry,
     model=model,
