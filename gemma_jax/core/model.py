@@ -1,11 +1,15 @@
 # %%
 
-"""Experimental model and inference code for text-only Gemma-3 written in a functional style in vanilla JAX.
+"""Experimental model and inference code for text-only Gemma-3 written in a
+functional style in vanilla JAX.
 
-OPTIMIZED VERSION: This implementation replaces the standard multi_head_attention with
-the modern ragged_gqa kernel from ragged_attention.py for improved performance on TPUs.
-The ragged attention kernel provides efficient fused attention computation with better
-memory locality and reduced HBM-VMEM data movement.
+OPTIMIZED VERSION: This implementation replaces the standard multi_head_attention
+with modern Pallas based kernels from ``ragged_attention.py`` for improved
+performance on TPUs.  The ragged attention kernels provide efficient fused
+attention computation with better memory locality and reduced HBM/VMEM data
+movement.  Both multi-head (``ragged_mha``) and group-query (``ragged_gqa``)
+variants are supported and automatically selected based on the number of KV
+heads in a layer.
 """
 
 import jax
@@ -366,14 +370,15 @@ def self_attention_ragged(
     auto_regressive: bool,
     layer_idx: int,
 ) -> tuple[jax.Array, Any]:
-  """Self attention using ragged GQA kernel on TPU, fallback on GPU/CPU.
-  
-  Key changes from original:
-  1. Detects device and uses ragged_gqa on TPU, fallback attention otherwise
-  2. Converts boolean masks to sequence lengths for ragged kernel
-  3. Handles prefill (T>1) by processing positions separately
-  4. Adapts block size to handle sequences shorter than default block size
-  5. Maintains compatibility with existing cache and RoPE logic
+  """Self attention using Pallas ragged kernels, with graceful fallbacks.
+
+  Key features:
+  1. Automatically selects ``ragged_mha`` or ``ragged_gqa`` depending on the
+     number of KV heads.
+  2. Converts boolean masks to sequence lengths for the ragged kernels.
+  3. Handles both prefill (``T > 1``) and generation (``T == 1``) cases.
+  4. Adjusts block size for shorter sequences and falls back to the reference
+     attention implementation if necessary.
   """
   
   query, key, value = qkv_projection(x, layer.q_proj, layer.kv_proj)
@@ -437,26 +442,39 @@ def self_attention_ragged(
           block_size = bs
           break
     
-    if T == 1:
-      # Generation case: use ragged_gqa directly
+    def _pallas_attention(q, mask):
       try:
-        attn_out, _, _ = ragged_gqa(
-            query_scaled,
-            cache_key,
-            cache_value,
-            lengths,
-            block_size=block_size,
-            mask_value=K_MASK,
-        )
+        if N == K:
+          out, _, _ = ragged_mha(
+              q,
+              cache_key,
+              cache_value,
+              mask,
+              block_size=block_size,
+              mask_value=K_MASK,
+          )
+        else:
+          out, _, _ = ragged_gqa(
+              q,
+              cache_key,
+              cache_value,
+              mask,
+              block_size=block_size,
+              mask_value=K_MASK,
+          )
+        return out
       except Exception as e:
-        # Fallback to standard attention if ragged fails
         print(f"Ragged attention failed: {e}, falling back to standard attention")
-        attn_out = multi_head_attention_fallback(
-            query_scaled.astype(jnp.float32),
+        return multi_head_attention_fallback(
+            q.astype(jnp.float32),
             cache_key.astype(jnp.float32),
             cache_value.astype(jnp.float32),
-            attn_mask_BTS,
+            mask.reshape(q.shape[0], 1, S),
         ).astype(x.dtype)
+
+    if T == 1:
+      # Generation case
+      attn_out = _pallas_attention(query_scaled, lengths)
     else:
       # Prefill case: process each position separately
       outputs = []
@@ -464,27 +482,8 @@ def self_attention_ragged(
         q_t = query_scaled[:, t:t+1, :, :]
         mask_t = attn_mask_BTS[:, t, :]
         lengths_t = mask_to_lengths(mask_t)
-        
-        try:
-          out_t, _, _ = ragged_gqa(
-              q_t,
-              cache_key,
-              cache_value,
-              lengths_t,
-              block_size=block_size,
-              mask_value=K_MASK,
-          )
-          outputs.append(out_t)
-        except Exception as e:
-          # Fallback for this position
-          print(f"Ragged attention failed for position {t}: {e}")
-          out_t = multi_head_attention_fallback(
-              q_t.astype(jnp.float32),
-              cache_key.astype(jnp.float32),
-              cache_value.astype(jnp.float32),
-              mask_t.reshape(B, 1, S),
-          ).astype(x.dtype)
-          outputs.append(out_t)
+        out_t = _pallas_attention(q_t, lengths_t)
+        outputs.append(out_t)
       
       attn_out = jnp.concatenate(outputs, axis=1)
   else:
